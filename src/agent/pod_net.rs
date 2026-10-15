@@ -121,6 +121,21 @@ fn ip_json(netns_path: &str, args: &[&str]) -> std::io::Result<serde_json::Value
         .map_err(|e| std::io::Error::other(format!("parse `ip {}` json: {e}", args.join(" "))))
 }
 
+/// Whether an `ip -j neigh` entry was programmed rather than learned: its
+/// state is PERMANENT or NOARP. iproute2 prints `state` as an array of flags
+/// (`["PERMANENT"]`); a plain string is accepted too.
+#[cfg(target_os = "linux")]
+fn neighbor_is_static(entry: &serde_json::Value) -> bool {
+    let is_static = |s: &str| matches!(s, "PERMANENT" | "NOARP");
+    match entry.get("state") {
+        Some(serde_json::Value::Array(states)) => {
+            states.iter().filter_map(|s| s.as_str()).any(is_static)
+        }
+        Some(serde_json::Value::String(state)) => is_static(state),
+        _ => false,
+    }
+}
+
 /// Parse `ip -j addr show <ifname>`, `ip -j route show default`, and
 /// `ip -j neigh show dev <ifname>` into the L3 config. Pure (no I/O) so it is
 /// unit-testable against captured JSON.
@@ -176,12 +191,16 @@ fn parse_pod_interface(
 
     // The gateway's MAC comes from the netns's neighbor table: CNIs that hand
     // out a /32 with a link-local gateway program it as a
-    // PERMANENT entry and answer no ARP, so the guest needs it up front.
+    // PERMANENT entry and answer no ARP, so the guest needs it up front. Only
+    // a statically programmed entry is copied: one the netns learned over ARP
+    // means the gateway answers ARP, and pinning it would leave the guest with
+    // a stale address if the gateway's MAC ever changed.
     let gateway_mac = gateway.and_then(|gw: Ipv4Addr| {
         neigh.as_array().and_then(|entries| {
             entries
                 .iter()
-                .find(|e| e.get("dst").and_then(|d| d.as_str()) == Some(&gw.to_string()))
+                .filter(|e| e.get("dst").and_then(|d| d.as_str()) == Some(&gw.to_string()))
+                .find(|e| neighbor_is_static(e))
                 .and_then(|e| e.get("lladdr"))
                 .and_then(|v| v.as_str())
                 .and_then(parse_mac)
@@ -253,14 +272,44 @@ mod tests {
         let route: serde_json::Value =
             serde_json::from_str(r#"[{"dst":"default","gateway":"169.254.1.1","dev":"eth0"}]"#)
                 .unwrap();
+        // iproute2 prints `state` as an array of flags.
         let neigh: serde_json::Value = serde_json::from_str(
-            r#"[{"dst":"169.254.1.1","lladdr":"02:00:00:00:00:02","dev":"eth0","state":"PERMANENT"}]"#,
+            r#"[{"dst":"169.254.1.1","lladdr":"02:00:00:00:00:02","dev":"eth0","state":["PERMANENT"]}]"#,
         )
         .unwrap();
 
         let p = parse_pod_interface(&addr, &route, &neigh, "eth0").unwrap();
         assert_eq!(p.gateway, Some("169.254.1.1".parse().unwrap()));
         assert_eq!(p.gateway_mac, Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]));
+    }
+
+    #[test]
+    fn ignores_a_learned_gateway_neighbor() {
+        // A gateway that answers ARP: the entry was learned, so the guest
+        // resolves it itself and nothing is pinned.
+        let addr: serde_json::Value = serde_json::from_str(
+            r#"[{"ifname":"eth0","mtu":1450,"address":"0a:58:0a:58:00:6c",
+                "addr_info":[{"family":"inet","local":"10.88.0.108","prefixlen":16}]}]"#,
+        )
+        .unwrap();
+        let route: serde_json::Value =
+            serde_json::from_str(r#"[{"dst":"default","gateway":"10.88.0.1","dev":"eth0"}]"#)
+                .unwrap();
+        for state in [r#"["REACHABLE"]"#, r#"["STALE"]"#, r#""DELAY""#] {
+            let neigh: serde_json::Value = serde_json::from_str(&format!(
+                r#"[{{"dst":"10.88.0.1","lladdr":"aa:bb:cc:dd:ee:ff","dev":"eth0","state":{state}}}]"#
+            ))
+            .unwrap();
+            let p = parse_pod_interface(&addr, &route, &neigh, "eth0").unwrap();
+            assert_eq!(p.gateway_mac, None, "state {state}");
+        }
+        // A NOARP entry is programmed, so it counts as static.
+        let neigh: serde_json::Value = serde_json::from_str(
+            r#"[{"dst":"10.88.0.1","lladdr":"aa:bb:cc:dd:ee:ff","dev":"eth0","state":"NOARP"}]"#,
+        )
+        .unwrap();
+        let p = parse_pod_interface(&addr, &route, &neigh, "eth0").unwrap();
+        assert_eq!(p.gateway_mac, Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
     }
 
     #[test]
