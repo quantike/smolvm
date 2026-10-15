@@ -463,6 +463,10 @@ pub fn launch_agent_vm_dynamic(
                     config.dns_filter_hosts.as_deref(),
                 )
                 .with_rules(&config.resources.egress_rules)
+                .and_then(|policy| match &config.resources.block_private {
+                    Some(exceptions) => policy.with_private_floor(exceptions),
+                    None => Ok(policy),
+                })
                 .map_err(|reason| format!("invalid egress rules: {reason}"))?
             } else {
                 // Networked only to serve published ports: inbound only,
@@ -796,6 +800,16 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    if !config.resources.disk_volumes.is_empty() {
+        if let Ok(cstr) = CString::new(format!(
+            "{}={}",
+            smolvm_protocol::guest_env::DISK_VOLUMES,
+            smolvm_protocol::disk_volume::encode(&config.resources.disk_volumes)
+        )) {
+            env_strings.push(cstr);
+        }
+    }
+
     // Tell the agent GPU was requested so it creates /dev/dri nodes and starts
     // seatd after pivot_root. Keep this in sync with the normal launcher.
     if config.resources.gpu {
@@ -878,10 +892,7 @@ pub fn launch_agent_vm_dynamic(
         // Layers the host extracted itself carry their ownership in the
         // override xattr; the Linux server presents it only when asked.
         let override_stat = cfg!(target_os = "linux")
-            && config
-                .layers_dir
-                .join(smolvm_pack::extract::OPAQUE_XATTR_MARKER)
-                .is_file();
+            && smolvm_pack::extract::shares_override_stat_layers(config.layers_dir);
         // SAFETY: ctx is valid, tag and path are valid C strings
         let added = if override_stat {
             let Some(add_virtiofs4) = krun.add_virtiofs4 else {

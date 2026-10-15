@@ -1357,6 +1357,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         egress_refresh_hosts.as_deref(),
                     )
                     .with_rules(&resources.egress_rules)
+                    .and_then(|policy| match &resources.block_private {
+                        Some(exceptions) => policy.with_private_floor(exceptions),
+                        None => Ok(policy),
+                    })
                     .map_err(|reason| Error::agent("egress rules", reason))?
                 } else {
                     // Networked only to serve published ports: inbound only,
@@ -2125,9 +2129,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 // Layers the host extracted itself carry their ownership in the
                 // override xattr; the Linux server presents it only when asked.
                 let override_stat = cfg!(target_os = "linux")
-                    && layers_dir
-                        .join(smolvm_pack::extract::OPAQUE_XATTR_MARKER)
-                        .is_file();
+                    && smolvm_pack::extract::shares_override_stat_layers(layers_dir);
                 let added = if override_stat {
                     let Some(add_virtiofs4) = krun.add_virtiofs4 else {
                         krun_free_ctx(ctx);
@@ -2282,6 +2284,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
         if let Some(env) = &cache_disk_env {
             env_strings.push(cstr(env));
+        }
+        if !resources.disk_volumes.is_empty() {
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::DISK_VOLUMES,
+                smolvm_protocol::disk_volume::encode(&resources.disk_volumes)
+            )));
         }
 
         // Pass mount count
